@@ -13,18 +13,19 @@ enum Command {
 }
 
 fn init() -> anyhow::Result<()> {
+    let default_branch = "main";
     std::fs::create_dir(".git")?;
     std::fs::create_dir(".git/objects")?;
     std::fs::create_dir(".git/refs")?;
     let mut f = std::fs::File::create(".git/HEAD")?;
-    writeln!(f, "")?;
+    writeln!(f, "ref: refs/heads/{default_branch}")?;
     Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.subcommand {
-        Command::Init => {}
+        Command::Init => init()?,
     }
     Ok(())
 }
