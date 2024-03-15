@@ -1,8 +1,12 @@
+#![allow(dead_code)]
+
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
+    process::Command,
 };
 
+use assert_cmd::cargo::CommandCargoExt;
 use predicates::Predicate;
 use tempdir::TempDir;
 
@@ -27,6 +31,18 @@ impl Temp {
 
     pub fn subpath<P: AsRef<Path>>(&self, path: P) -> PathBuf {
         self.inner.path().join(path.as_ref())
+    }
+
+    pub fn git(&self) -> Command {
+        let mut cmd = Command::cargo_bin("git-rs").expect("failed to compile command");
+        cmd.current_dir(self.path());
+        cmd
+    }
+}
+
+impl Default for Temp {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
