@@ -1,15 +1,16 @@
 use anyhow::{bail, Context};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use flate2::read::ZlibDecoder;
-use itertools::Itertools;
-use nom::{bytes::complete::tag, character::complete::digit1, IResult, ParseTo};
+use hash::Hash;
+use object::{Blob, Object};
 use std::{
-    fmt::Display,
-    io::{stdout, Read, Write},
+    fs::{create_dir, File},
+    io::{self, stdout, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    str::FromStr,
 };
+mod hash;
+mod object;
 
 pub fn root() -> PathBuf {
     ".git".into()
@@ -47,10 +48,30 @@ enum Command {
         #[clap(requires = "mode")]
         object: String,
     },
+    #[clap(group(ArgGroup::new("input").required(true).args(&["file", "stdin"])  ))]
     HashObject {
-        #[clap(short = 'w')]
-        file: String,
+        /// Writes the object back to the store
+        #[clap(short)]
+        write: bool,
+        /// Type of the object
+        #[clap(short, value_enum)]
+        typ: Option<BlobType>,
+        /// Read from stdin instead of file
+        #[clap(long)]
+        stdin: bool,
+
+        /// The file
+        file: Option<String>,
     },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Default)]
+enum BlobType {
+    #[default]
+    Blob,
+    Commit,
+    Tree,
+    Tag,
 }
 
 pub fn init() -> anyhow::Result<()> {
@@ -61,103 +82,6 @@ pub fn init() -> anyhow::Result<()> {
     let mut f = std::fs::File::create(".git/HEAD")?;
     writeln!(f, "ref: refs/heads/{default_branch}")?;
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct Hash {
-    buf: [u8; 20],
-}
-
-#[derive(Debug, derive_more::Display, Clone, thiserror::Error)]
-enum HashError {
-    WrongLength,
-    UnexpectedChar(char),
-}
-
-impl FromStr for Hash {
-    type Err = HashError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        fn to_nibble(ch: char) -> Result<u8, HashError> {
-            match ch {
-                '0'..='9' => Ok((ch as u8) - b'0'),
-                'a'..='f' => Ok((ch as u8) - b'a' + 10),
-                _ => Err(HashError::UnexpectedChar(ch)),
-            }
-        }
-        let mut buf = [0; 20];
-        if s.len() != 40 {
-            return Err(HashError::WrongLength);
-        }
-        for (i, mut ch) in s.chars().chunks(2).into_iter().enumerate() {
-            let first = to_nibble(ch.next().unwrap())?;
-            let second = to_nibble(ch.next().unwrap())?;
-            buf[i] = first << 4 | second;
-        }
-
-        Ok(Self { buf })
-    }
-}
-
-impl Display for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in self.buf {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Hash {
-    pub fn object_path(&self) -> PathBuf {
-        let s = self.to_string();
-        let mut path = PathBuf::new();
-
-        path.push(&s[..2]);
-        path.push(&s[2..]);
-
-        path
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Blob<'a> {
-    content: &'a [u8],
-}
-
-impl Display for Blob<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "blob {}\0", self.content.len())?;
-        for &ch in self.content {
-            write!(f, "{}", ch as char)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, derive_more::Display, Clone, thiserror::Error)]
-pub enum BlobError {
-    FormatError,
-    LengthMismatch,
-}
-
-impl<'a> TryFrom<&'a [u8]> for Blob<'a> {
-    type Error = BlobError;
-
-    fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
-        fn parser(s: &[u8]) -> IResult<&[u8], &[u8]> {
-            let (s, _) = tag("blob ")(s)?;
-            let (s, len) = digit1(s)?;
-            let (s, _) = tag("\0")(s)?;
-            let len: usize = len.parse_to().unwrap();
-            let (rest, blob) = nom::bytes::complete::take(len)(s)?;
-            Ok((rest, blob))
-        }
-        let (rest, blob) = parser(value).map_err(|_| BlobError::FormatError)?;
-        if !rest.is_empty() {
-            return Err(BlobError::LengthMismatch);
-        }
-        Ok(Blob { content: blob })
-    }
 }
 
 pub struct CatFile {
@@ -201,11 +125,50 @@ impl CatFile {
         let mut decoder = ZlibDecoder::new(data.as_slice());
         let mut contents = Vec::new();
         decoder.read_to_end(&mut contents)?;
+        // TODO: object, not blob
         let blob: Blob = contents.as_slice().try_into()?;
 
-        stdout().lock().write_all(blob.content)?;
+        stdout().lock().write_all(blob.content())?;
 
         Ok(())
+    }
+}
+
+pub struct HashObject {
+    object: Object,
+}
+
+impl HashObject {
+    pub fn new_blob(mut source: Box<dyn BufRead>) -> anyhow::Result<Self> {
+        let mut buf = Vec::new();
+        source.read_to_end(&mut buf)?;
+        let object = Object::Blob(Blob::new(buf));
+
+        Ok(Self { object })
+    }
+
+    pub fn write(&self) -> anyhow::Result<()> {
+        // hash will be computed twice
+        // question: do i care?
+        let hash = self.hash();
+
+        create_dir(root().push_dir("objects").push_dir(hash.dir())).or_else(|x| {
+            match x.kind() {
+                std::io::ErrorKind::AlreadyExists => Ok(()),
+                _ => Err(x),
+            }
+        })?;
+        let path = root().push_dir("objects").push_dir(hash.object_path());
+        let mut file = File::create(path).context("failed to create object file")?;
+
+        write!(file, "{}", self.object)?;
+
+        Ok(())
+    }
+
+    pub fn hash(&self) -> Hash {
+        let s = self.object.to_string();
+        Hash::from_bytes(s.as_bytes())
     }
 }
 
@@ -230,8 +193,27 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             }
         }
-        Command::HashObject { .. } => {
-            todo!()
+        Command::HashObject {
+            write,
+            typ: _,
+            stdin,
+            file,
+        } => {
+            let source: Box<dyn BufRead> = if stdin {
+                Box::new(BufReader::new(io::stdin().lock()))
+            } else {
+                let file = file.expect("guaranteed to not be none");
+                let file = File::open(file)?;
+                Box::new(BufReader::new(file))
+            };
+
+            let cmd = HashObject::new_blob(source)?;
+
+            if write {
+                cmd.write()?;
+            }
+
+            println!("{}", cmd.hash());
         }
     }
     Ok(ExitCode::SUCCESS)
