@@ -99,9 +99,37 @@ fn hash_object() -> anyhow::Result<()> {
 }
 
 #[test]
-fn ls_tree() {
+fn ls_tree() -> anyhow::Result<()> {
     let dir = make_dir();
     dir.git().arg("init").assert().success();
+
+    let reference_sha = {
+        let real = make_dir();
+        create_dir(real.subpath("dir1"))?;
+        create_dir(real.subpath("dir2"))?;
+        File::create(real.subpath("file0"))?;
+        File::create(real.subpath("dir1/file1"))?;
+        File::create(real.subpath("dir2/file2"))?;
+        File::create(real.subpath("dir2/other_file2"))?;
+
+        real.cmd("git").arg("init").spawn()?.wait()?;
+        let sha = real.cmd("git").arg("write-tree").output()?.stdout;
+
+        real.cmd("cp")
+            .args(["-r", ".git/objects"])
+            .arg(dir.subpath(".git/objects"))
+            .spawn()?
+            .wait()?;
+
+        String::from_utf8(sha)?
+    };
+
+    dir.cmd("exa").args(["--tree", ".git"]).spawn()?.wait()?;
+
+    dir.git()
+        .args(["ls-tree", "--name-only", &reference_sha])
+        .assert()
+        .success();
 
     todo!()
 }

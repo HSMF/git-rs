@@ -38,6 +38,12 @@ impl Temp {
         cmd.current_dir(self.path());
         cmd
     }
+
+    pub fn cmd(&self, program: &str) -> Command {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(self.path());
+        cmd
+    }
 }
 
 impl Default for Temp {
