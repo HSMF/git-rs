@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-use crate::common::file_contents;
+use crate::common::{file_contents, CommandExt};
 
 mod common;
 
@@ -112,24 +112,30 @@ fn ls_tree() -> anyhow::Result<()> {
         File::create(real.subpath("dir2/file2"))?;
         File::create(real.subpath("dir2/other_file2"))?;
 
-        real.cmd("git").arg("init").spawn()?.wait()?;
+        real.cmd("git").arg("init").silence().spawn()?.wait()?;
+        real.cmd("git")
+            .args(["add", "."])
+            .silence()
+            .spawn()?
+            .wait()?;
         let sha = real.cmd("git").arg("write-tree").output()?.stdout;
 
         real.cmd("cp")
             .args(["-r", ".git/objects"])
-            .arg(dir.subpath(".git/objects"))
+            .arg(dir.subpath(".git"))
             .spawn()?
             .wait()?;
 
-        String::from_utf8(sha)?
+        let s = String::from_utf8(sha)?;
+        s.trim_end().to_owned()
     };
 
-    dir.cmd("exa").args(["--tree", ".git"]).spawn()?.wait()?;
-
+    println!("{}", dir.path().display());
     dir.git()
         .args(["ls-tree", "--name-only", &reference_sha])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::diff("dir1\ndir2\nfile0\n"));
 
-    todo!()
+    Ok(())
 }

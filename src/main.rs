@@ -2,13 +2,15 @@ use anyhow::{bail, Context};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use flate2::read::ZlibDecoder;
 use hash::Hash;
-use object::{Blob, Object};
+use itertools::Itertools;
+use object::{Blob, Object, Tree, ZlibWriter};
 use std::{
     fs::{create_dir, File},
     io::{self, stdout, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
+use walkdir::WalkDir;
 mod hash;
 mod object;
 
@@ -24,6 +26,37 @@ impl PathBufExt for PathBuf {
     fn push_dir<P: AsRef<Path>>(mut self, path: P) -> Self {
         self.push(path);
         self
+    }
+}
+
+trait IoErrorExt {
+    type Item;
+    fn ignore(self, kind: std::io::ErrorKind, default: Self::Item) -> Self;
+}
+
+impl<T> IoErrorExt for io::Result<T> {
+    type Item = T;
+    fn ignore(self, kind: std::io::ErrorKind, default: Self::Item) -> Self {
+        self.or_else(|x| {
+            if x.kind() == kind {
+                Ok(default)
+            } else {
+                Err(x)
+            }
+        })
+    }
+}
+
+pub trait Writeable {
+    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()>;
+}
+
+impl<T> Writeable for &T
+where
+    T: Writeable,
+{
+    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+        (*self).fmt(f)
     }
 }
 
@@ -63,6 +96,19 @@ enum Command {
         /// The file
         file: Option<String>,
     },
+
+    LsTree {
+        #[clap(long, group = "only")]
+        name_only: bool,
+        #[clap(long, group = "only")]
+        object_only: bool,
+        #[clap(short)]
+        recursive: bool,
+
+        tree_hash: String,
+    },
+
+    WriteTree {},
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Default)]
@@ -139,12 +185,8 @@ pub struct HashObject {
 }
 
 impl HashObject {
-    pub fn new_blob(mut source: Box<dyn BufRead>) -> anyhow::Result<Self> {
-        let mut buf = Vec::new();
-        source.read_to_end(&mut buf)?;
-        let object = Object::Blob(Blob::new(buf));
-
-        Ok(Self { object })
+    pub fn new(object: Object) -> Self {
+        Self { object }
     }
 
     pub fn write(&self) -> anyhow::Result<()> {
@@ -152,16 +194,13 @@ impl HashObject {
         // question: do i care?
         let hash = self.hash();
 
-        create_dir(root().push_dir("objects").push_dir(hash.dir())).or_else(|x| {
-            match x.kind() {
-                std::io::ErrorKind::AlreadyExists => Ok(()),
-                _ => Err(x),
-            }
-        })?;
+        create_dir(root().push_dir("objects").push_dir(hash.dir()))
+            .ignore(std::io::ErrorKind::AlreadyExists, ())?;
         let path = root().push_dir("objects").push_dir(hash.object_path());
         let mut file = File::create(path).context("failed to create object file")?;
 
-        write!(file, "{}", self.object)?;
+        let obj = ZlibWriter::new(&self.object);
+        obj.fmt(&mut file)?;
 
         Ok(())
     }
@@ -207,13 +246,57 @@ fn main() -> anyhow::Result<ExitCode> {
                 Box::new(BufReader::new(file))
             };
 
-            let cmd = HashObject::new_blob(source)?;
+            let cmd = HashObject::new(Object::new_blob(source)?);
 
             if write {
                 cmd.write()?;
             }
 
             println!("{}", cmd.hash());
+        }
+
+        Command::LsTree {
+            name_only,
+            object_only,
+            tree_hash,
+            recursive,
+        } => {
+            let hash: Hash = tree_hash.parse()?;
+            let path = root().push_dir("objects").push_dir(hash.object_path());
+            let data = std::fs::read(path)?;
+            let mut decoder = ZlibDecoder::new(data.as_slice());
+            let mut contents = Vec::new();
+            decoder.read_to_end(&mut contents)?;
+
+            let tree: Tree = contents.as_slice().try_into()?;
+            let mut printer = tree.display();
+            if recursive {
+                printer.recusive();
+            }
+            if name_only {
+                printer.no_type();
+                printer.no_perms();
+                printer.no_object();
+            }
+            if object_only {
+                printer.no_type();
+                printer.no_perms();
+                printer.no_name();
+            }
+
+            print!("{}", printer);
+        }
+
+        Command::WriteTree {} => {
+            let (ok, err): (Vec<_>, Vec<_>) = WalkDir::new(".")
+                .into_iter()
+                .filter_entry(|e| e.file_name() != ".git")
+                .partition_result();
+            for e in err {
+                eprintln!("Error: {e}");
+            }
+            let tree = Tree::write_tree(ok.into_iter())?;
+            println!("{}", tree);
         }
     }
     Ok(ExitCode::SUCCESS)

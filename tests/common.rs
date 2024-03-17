@@ -3,8 +3,18 @@
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
+
+pub trait CommandExt {
+    fn silence(&mut self) -> &mut Self;
+}
+
+impl CommandExt for Command {
+    fn silence(&mut self) -> &mut Self {
+        self.stdout(Stdio::null()).stderr(Stdio::null())
+    }
+}
 
 use assert_cmd::cargo::CommandCargoExt;
 use predicates::Predicate;

@@ -3,14 +3,40 @@ use std::{fmt::Display, path::PathBuf, str::FromStr};
 use itertools::Itertools;
 use sha1::{Digest, Sha1};
 
-use crate::PathBufExt;
+use crate::{PathBufExt, Writeable};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Hash {
     buf: [u8; 20],
 }
 
+impl std::fmt::Debug for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hash({self})")
+    }
+}
+
+impl Writeable for Hash {
+    /// writes the hash in compact form
+    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+        f.write_all(self.buf.as_slice())?;
+        Ok(())
+    }
+}
+
 impl Hash {
+    pub fn from_raw(b: &[u8]) -> Option<Self> {
+        if b.len() != 20 {
+            return None;
+        }
+
+        let mut buf = [0; 20];
+        for (i, b) in b.iter().enumerate() {
+            buf[i] = *b;
+        }
+        Some(Self { buf })
+    }
+
     pub fn from_bytes(b: &[u8]) -> Self {
         let mut hasher = Sha1::new();
         hasher.update(b);
@@ -79,4 +105,3 @@ impl Hash {
         PathBuf::new().push_dir(&s[..2])
     }
 }
-
