@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Read, Write};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
+use chrono::{DateTime, Local};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -19,14 +21,8 @@ use nom::{
 };
 use walkdir::DirEntry;
 
-use crate::Writeable;
 use crate::{hash::Hash, root, IoErrorExt, PathBufExt};
-
-fn hash(x: impl Writeable) -> Hash {
-    let mut buf = Cursor::new(Vec::new());
-    x.fmt(&mut buf).unwrap();
-    Hash::from_bytes(buf.into_inner().as_slice())
-}
+use crate::{ReadError, Readable, Writeable};
 
 pub struct ZlibWriter<T>(T);
 
@@ -36,11 +32,32 @@ impl<T> ZlibWriter<T> {
     }
 }
 
+pub trait ZlibReadExt {
+    fn zlib_read<T>(&mut self) -> Result<T, ReadError<<T as Readable>::Error>>
+    where
+        T: Readable;
+}
+
+impl<Src> ZlibReadExt for Src
+where
+    Src: Read,
+{
+    fn zlib_read<T>(&mut self) -> Result<T, ReadError<<T as Readable>::Error>>
+    where
+        T: Readable,
+    {
+        let mut bytes = Vec::new();
+        self.read_to_end(&mut bytes).map_err(ReadError::IoError)?;
+        let decoder = ZlibDecoder::new(bytes.as_slice());
+        <T as Readable>::read(decoder)
+    }
+}
+
 impl<T> Writeable for ZlibWriter<T>
 where
     T: Writeable,
 {
-    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+    fn fmt<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         self.0.fmt(&mut encoder)?;
 
@@ -77,7 +94,7 @@ impl Display for Blob {
 }
 
 impl Writeable for Blob {
-    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+    fn fmt<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
         write!(f, "blob {}\0", self.content.len())?;
         f.write_all(&self.content)?;
         Ok(())
@@ -113,6 +130,23 @@ impl TryFrom<&[u8]> for Blob {
     }
 }
 
+impl Readable for Blob {
+    type Error = ParseError;
+    fn read<R: std::io::Read>(mut r: R) -> Result<Blob, ReadError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let mut contents = Vec::new();
+        r.read_to_end(&mut contents).map_err(ReadError::IoError)?;
+        let blob: Blob = contents
+            .as_slice()
+            .try_into()
+            .map_err(ReadError::ParseError)?;
+
+        Ok(blob)
+    }
+}
+
 #[derive(Debug, derive_more::Display)]
 pub enum Object {
     Blob(Blob),
@@ -120,7 +154,7 @@ pub enum Object {
 }
 
 impl Writeable for Object {
-    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+    fn fmt<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
         match self {
             Object::Blob(b) => <Blob as Writeable>::fmt(b, f)?,
             Object::Tree(t) => <Tree as Writeable>::fmt(t, f)?,
@@ -141,6 +175,14 @@ impl Object {
     pub fn hash(&self) -> Hash {
         let s = self.to_string();
         Hash::from_bytes(s.as_bytes())
+    }
+
+    /// creates everything necessary to write the object file
+    pub fn path(h: &Hash) -> anyhow::Result<PathBuf> {
+        let path = root().push_dir("objects").push_dir(h.dir());
+        create_dir(path).ignore(std::io::ErrorKind::AlreadyExists, ())?;
+        let path = root().push_dir("objects").push_dir(h.object_path());
+        Ok(path)
     }
 }
 
@@ -198,7 +240,7 @@ impl Display for Tree {
 }
 
 impl Writeable for Tree {
-    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+    fn fmt<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
         let size: usize = self
             .entries
             .iter()
@@ -214,6 +256,23 @@ impl Writeable for Tree {
         }
 
         Ok(())
+    }
+}
+
+impl Readable for Tree {
+    type Error = ParseError;
+    fn read<R: std::io::Read>(mut r: R) -> Result<Self, ReadError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        let mut contents = Vec::new();
+        r.read_to_end(&mut contents).map_err(ReadError::IoError)?;
+        let tree: Self = contents
+            .as_slice()
+            .try_into()
+            .map_err(ReadError::ParseError)?;
+
+        Ok(tree)
     }
 }
 
@@ -327,7 +386,13 @@ impl Tree {
                 let hash = if entry.file_type().is_dir() {
                     foo(map, trees, entry.path())?
                 } else {
-                    Object::Blob(Blob::new(std::fs::read(entry.path())?)).hash()
+                    let blob = Blob::new(std::fs::read(entry.path())?);
+                    let id = Hash::from_writable(&blob);
+                    let path = Object::path(&id)?;
+                    let mut f = File::create(path)?;
+                    ZlibWriter::new(blob).fmt(&mut f)?;
+
+                    id
                 };
                 let perms = if entry.file_type().is_dir() {
                     Perms::Directory
@@ -346,7 +411,7 @@ impl Tree {
             }
 
             let tree = Tree { entries: children };
-            let hash = hash(&tree);
+            let hash = Hash::from_writable(&tree);
             trees.push(tree);
             Ok(hash)
         }
@@ -355,10 +420,8 @@ impl Tree {
         let hashed = foo(&collection, &mut trees, PathBuf::from(".").as_path())?;
 
         for tree in trees {
-            let hashed = hash(&tree);
-            dbg!(&hashed);
-            let path = root().push_dir("objects").push_dir(hashed.object_path());
-            create_dir(path.parent().unwrap()).ignore(std::io::ErrorKind::AlreadyExists, ())?;
+            let hashed = Hash::from_writable(&tree);
+            let path = Object::path(&hashed)?;
             let mut f = File::create(path)?;
             let writer = ZlibWriter::new(&tree);
             writer.fmt(&mut f)?;
@@ -482,5 +545,115 @@ impl Display for TreePrinter<'_> {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct Event {
+    name: String,
+    email: String,
+    time: DateTime<Local>,
+}
+
+impl Event {
+    pub fn new(name: String, email: String) -> Self {
+        let now: DateTime<Local> = Local::now();
+        // let x = now.offset().local_minus_utc();
+        Event {
+            name,
+            email,
+            time: now,
+        }
+    }
+}
+
+impl Writeable for Event {
+    fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()> {
+        let offset = self.time.offset().local_minus_utc() / 60 / 60;
+        let sign = offset >= 0;
+        write!(
+            f,
+            "{} <{}> {} {}{:04}",
+            self.name,
+            self.email,
+            self.time.timestamp(),
+            if sign { "+" } else { "-" },
+            offset.abs()
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct Commit {
+    parents: Vec<Hash>,
+    tree: Hash,
+    author: Event,
+    committer: Event,
+    commit_message: String,
+}
+
+impl Writeable for Commit {
+    fn fmt<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
+        let mut body = Vec::with_capacity(
+            "tree".len() + "author".len() + "committer".len() + self.commit_message.len(),
+        );
+
+        writeln!(body, "tree {}", self.tree)?;
+        for parent in &self.parents {
+            writeln!(body, "parent {parent}")?;
+        }
+
+        write!(body, "author ")?;
+        self.author.fmt(&mut body)?;
+        writeln!(body)?;
+
+        write!(body, "committer ")?;
+        self.committer.fmt(&mut body)?;
+        writeln!(body)?;
+
+        writeln!(body)?;
+        write!(body, "{}", self.commit_message)?;
+
+        write!(f, "commit {}\0", body.len())?;
+        f.write_all(body.as_slice())
+    }
+}
+
+impl Readable for Commit {
+    type Error = ParseError;
+
+    fn read<R: std::io::Read>(_: R) -> Result<Self, ReadError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        todo!()
+    }
+}
+
+impl Commit {
+    pub fn new(
+        tree: Hash,
+        message: &str,
+        author: Event,
+        committer: Event,
+        parents: impl IntoIterator<Item = Hash>,
+    ) -> anyhow::Result<Self> {
+        if !root()
+            .push_dir("objects")
+            .push_dir(tree.object_path())
+            .metadata()
+            .context("tree does not exist")?
+            .is_file()
+        {
+            anyhow::bail!("no such tree: {tree}");
+        }
+        Ok(Commit {
+            tree,
+            author,
+            committer,
+            commit_message: message.to_owned(),
+            parents: parents.into_iter().collect(),
+        })
     }
 }

@@ -1,16 +1,18 @@
 use anyhow::{bail, Context};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use flate2::read::ZlibDecoder;
 use hash::Hash;
 use itertools::Itertools;
-use object::{Blob, Object, Tree, ZlibWriter};
+use object::{Blob, Object, Tree, ZlibReadExt, ZlibWriter};
 use std::{
+    fmt::Debug,
     fs::{create_dir, File},
-    io::{self, stdout, BufRead, BufReader, Read, Write},
+    io::{self, stdout, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 use walkdir::WalkDir;
+
+use crate::object::{Commit, Event};
 mod hash;
 mod object;
 
@@ -47,8 +49,30 @@ impl<T> IoErrorExt for io::Result<T> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError<E> {
+    IoError(std::io::Error),
+    ParseError(E),
+}
+
+impl<E> std::fmt::Display for ReadError<E>
+where
+    E: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
 pub trait Writeable {
     fn fmt<W: std::io::Write>(&self, f: &mut W) -> std::io::Result<()>;
+}
+
+pub trait Readable {
+    type Error;
+    fn read<R: std::io::Read>(r: R) -> Result<Self, ReadError<Self::Error>>
+    where
+        Self: Sized;
 }
 
 impl<T> Writeable for &T
@@ -109,6 +133,15 @@ enum Command {
     },
 
     WriteTree {},
+
+    CommitTree {
+        #[clap(short)]
+        parent: Vec<Hash>,
+        #[clap(short)]
+        message: Vec<String>,
+
+        tree: Hash,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Default)]
@@ -167,12 +200,10 @@ impl CatFile {
     pub fn pretty(&self) -> anyhow::Result<()> {
         let path = self.path();
 
-        let data = std::fs::read(path)?;
-        let mut decoder = ZlibDecoder::new(data.as_slice());
-        let mut contents = Vec::new();
-        decoder.read_to_end(&mut contents)?;
+        let mut f = File::open(path)?;
+
         // TODO: object, not blob
-        let blob: Blob = contents.as_slice().try_into()?;
+        let blob: Blob = f.zlib_read()?;
 
         stdout().lock().write_all(blob.content())?;
 
@@ -263,12 +294,10 @@ fn main() -> anyhow::Result<ExitCode> {
         } => {
             let hash: Hash = tree_hash.parse()?;
             let path = root().push_dir("objects").push_dir(hash.object_path());
-            let data = std::fs::read(path)?;
-            let mut decoder = ZlibDecoder::new(data.as_slice());
-            let mut contents = Vec::new();
-            decoder.read_to_end(&mut contents)?;
 
-            let tree: Tree = contents.as_slice().try_into()?;
+            let mut f = File::open(path)?;
+            let tree: Tree = f.zlib_read()?;
+
             let mut printer = tree.display();
             if recursive {
                 printer.recusive();
@@ -297,6 +326,28 @@ fn main() -> anyhow::Result<ExitCode> {
             }
             let tree = Tree::write_tree(ok.into_iter())?;
             println!("{}", tree);
+        }
+
+        Command::CommitTree {
+            parent,
+            message,
+            tree,
+        } => {
+            let author = Event::new(
+                "hello world".to_owned(),
+                "hello.world@example.com".to_owned(),
+            );
+            let committer = Event::new(
+                "hello world".to_owned(),
+                "hello.world@example.com".to_owned(),
+            );
+            let message = message.join(" ");
+            let commit = Commit::new(tree, &message, author, committer, parent)?;
+            dbg!(&commit);
+            let id = Hash::from_writable(&commit);
+            let mut file = File::create(Object::path(&id)?)?;
+            ZlibWriter::new(commit).fmt(&mut file)?;
+                println!("{id}");
         }
     }
     Ok(ExitCode::SUCCESS)

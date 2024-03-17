@@ -1,4 +1,4 @@
-use std::{fmt::Display, path::PathBuf, str::FromStr};
+use std::{fmt::Display, io::Cursor, path::PathBuf, str::FromStr};
 
 use itertools::Itertools;
 use sha1::{Digest, Sha1};
@@ -47,6 +47,12 @@ impl Hash {
         }
 
         Self { buf }
+    }
+
+    pub fn from_writable(x: impl Writeable) -> Hash {
+        let mut buf = Cursor::new(Vec::new());
+        x.fmt(&mut buf).unwrap();
+        Hash::from_bytes(buf.into_inner().as_slice())
     }
 }
 
