@@ -139,3 +139,71 @@ fn ls_tree() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn write_tree() -> anyhow::Result<()> {
+    let dir = make_dir();
+    dir.git().arg("init").assert().success();
+    let real = make_dir();
+
+    {
+        create_dir(real.subpath("dir1"))?;
+        create_dir(real.subpath("dir2"))?;
+        File::create(real.subpath("file0"))?;
+        File::create(real.subpath("dir1/file1"))?;
+        File::create(real.subpath("dir2/file2"))?;
+        File::create(real.subpath("dir2/other_file2"))?;
+
+        real.cmd("git").arg("init").silence().spawn()?.wait()?;
+        real.cmd("git")
+            .args(["add", "."])
+            .silence()
+            .spawn()?
+            .wait()?;
+        real.cmd("git")
+            .arg("write-tree")
+            .silence()
+            .spawn()?
+            .wait()?;
+    };
+
+    create_dir(dir.subpath("dir1"))?;
+    create_dir(dir.subpath("dir2"))?;
+    File::create(dir.subpath("file0"))?;
+    File::create(dir.subpath("dir1/file1"))?;
+    File::create(dir.subpath("dir2/file2"))?;
+    File::create(dir.subpath("dir2/other_file2"))?;
+
+    dir.git().args(["write-tree"]).assert().success();
+
+    for f in walkdir::WalkDir::new(dir.subpath(".git/objects")) {
+        let f = f?;
+        let p = f.path();
+        let reference_path = real
+            .path()
+            .join(p.parent().unwrap())
+            .join(p.file_name().unwrap());
+
+        let got = std::fs::metadata(p)?;
+        let expected = std::fs::metadata(&reference_path)?;
+        assert_eq!(got.permissions(), expected.permissions());
+        assert_eq!(got.file_type(), expected.file_type());
+
+        if !got.is_file() {
+            continue;
+        }
+
+        let got = std::fs::read(p)?;
+        let expected = std::fs::read(&reference_path)?;
+
+        assert_eq!(
+            got,
+            expected,
+            "{} != {}",
+            p.display(),
+            reference_path.display()
+        );
+    }
+
+    Ok(())
+}
